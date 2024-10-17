@@ -1,0 +1,902 @@
+---
+title: "ST443 ML Group Project"
+date: "December 2023"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 5
+---
+## 1. Introduction
+We would like to use socio-demographic data on the US census tract level to determine **predict** whether a given census tract
+experience a positive economic growth, measured by the median income.
+
+We will be using data from the US Census Bureau that is retrieved through API requests.
+
+```{r setup, results= 'hide', warning = F, message = F}
+knitr::opts_chunk$set(echo = TRUE,results= 'hide', warning = F, message = F)
+
+# data processing 
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+
+# api data collection
+library(httr) # return html request
+library(jsonlite) # parsing json
+library(glue) # formating api query
+
+# data processing 
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(reshape2)
+
+# plotting packages
+library(ggplot2)
+library(GGally)
+library(corrplot)
+
+# model fitting package
+library(ISLR)
+library(glmnet)
+library(caret)
+library(pls)
+library(MASS)
+library(leaps)
+library(tree)
+library(randomForest)
+library(class)
+library(neuralnet)
+```
+
+## 2. Loading the Data
+The dataset is retrieved through an API request to the US Census Bureau.
+We defined a custom function `USCB_api_r` which returns a dataframe where 
+each row represents a census tract, uniquely identified by a 11-digit FIPS code, 
+and the socio-demographic indicators for a given state.
+```{r api_req_setup, warning = F}
+# define the api query
+USCB_api_r <- function(year, table, state,query, county = "*", geog_lvl = "tract"){
+  # transform the state into a 2 digit fips code
+  state <- sprintf(paste0("%0", 2, "d"), state)
+  #` Assume all counties from the stat
+  url <- glue("https://api.census.gov/data/{year}/{table}?get={query}&for={geog_lvl}:*&in=state:{state}&in=county:{county}")
+  res <- httr::GET(url)
+
+  # check if the API request is successful 
+  if (res$status_code == 200){
+    # parse the json to data and the col names
+    res_json <- httr::content(res, "text")
+    col <- fromJSON(res_json, flatten = T)[1,]
+    data <- fromJSON(res_json, flatten = T)[-1,]
+    # parse into a df
+    df <- as.data.frame(data)
+    colnames(df) <- col
+
+    # concatenate the fips column into one unique 11-digit id
+    df <- df  %>%
+            mutate(fips = paste(state,county,tract, sep = ""))  %>%
+            subset(select = -c(state,county,tract))
+
+  }  else {
+    print("The API request failed: " + url)
+    break
+  }
+
+  return(df)
+}
+
+# define custom function to run a for loop to retrieve data from all state
+USCB_year_table <- function(year, table, query ){
+  #states <- (1:56)[!(1:56 %in% c(3, 7, 14, 43, 52))]
+  states<- c(36) # getting new york only
+  datalist = vector("list", length = length(states))
+
+  # for loop to retreive all state data
+  for (state_ind in seq(1,length(states), by = 1)){
+    new_data <- USCB_api_r(year,table,states[state_ind], query)
+    datalist[[state_ind]] <- new_data
+    print(paste("State ", states[state_ind]," df returned"))
+    print(dim(new_data))
+  }
+  # bind all the state tables into on dataframe
+  full_df<- do.call(rbind, datalist)
+
+  return(full_df)
+}
+
+```
+
+Since the variables we are interested in are located at 3 different tables, we will have to run 3 sets of for loop.
+The function is written such that a for loop could be used to iteratate through all 50 state 
+fips code to return the all observations made available through the API 
+shall we wish to expand the dataset later.
+
+The following tables listed out the variable codes and the  variable names that we are interested in, 
+and the table where they are stored in.
+
+
+|variables                                   | Encoding      | Year |  Table           |
+|--------------------------------------------|-------------- |------| ---------------- |
+|Median age                                  |B01002_001E    |2019  | acs/acs5         |
+|Education Attaintment (Bachelor or Above)   |B16010_041E    |2019  | acs/acs5         |
+|Total population>25yo(Education Attainment) |B16010_001E    |2019  | acs/acs5         |
+|Household with Social Security income       |B19055_002E    |2019  | acs/acs5         |
+|No. of Household (Social Security income)   |B19055_001E    |2019  | acs/acs5         |
+|Population (white)                          |B02001_002E    |2019  | acs/acs5         |
+|Total population                            |B02001_001E    |2019  | acs/acs5         |
+|Total working population in labour force    |B23025_002E    |2019  | acs/acs5         |
+|Civilian Labour Force in Employment         |B23025_004E    |2019  | acs/acs5         |
+|Total population with work experience       |C18121_001E    |2019  | acs/acs5         |
+|Population worked full-time                 |C18121_002E    |2019  | acs/acs5         |
+|Population worked less than full-time       |C18121_006E    |2019  | acs/acs5         |
+|Population with employment sector data      |B24031_001E    |2019  | acs/acs5         |
+|Median income in Manufacturing Sector       |B24031_006E    |2019  | acs/acs5         |
+|Median income in Agricultural Sector        |B24031_002E    |2019  | acs/acs5         |
+|Median H. Income(2019 inflation-adjusted)   |DP03_0062E     |2019  | acs/acs5/profile |
+|Percentage Houshold - Owner Occupied        |DP04_0046PE    |2019  | acs/acs5/profile |
+|Percentage Household with Social Security   |DP03_0066PE    |2019  | acs/acs5/profile |
+|Population employed to Agriculture          |DP03_0035PE    |2019  | acs/acs5/profile |
+|Population employed to Manufacturing        |DP03_0035PE    |2019  | acs/acs5/profile |
+|Median H. Income(2014 inflation-adjusted)   |DP03_0062E     |2014  | acs/acs5/profile |
+
+
+
+```{r api_res}
+# retreive 2019 acs/acs5 data
+query_acs_2019 <- 'B01002_001E,B16010_041E,B16010_001E,B19055_001E,B19055_002E,B02001_002E,B02001_001E,B23025_002E,B23025_004E,C18121_001E,C18121_002E,C18121_006E,B24031_001E,B24031_006E,B24031_002E'
+acs_main_2019 <- USCB_year_table("2019", "acs/acs5",query_acs_2019 )
+
+# retrieve 2019 acs/acs5/profile data
+query_acs_profile_2019 <- "DP03_0062E,DP04_0046PE,DP03_0066PE,DP03_0033PE,DP03_0035PE"
+acs_profile_2019 <- USCB_year_table("2019", "acs/acs5/profile",query_acs_profile_2019 )
+
+# retrieve 2014 acs/acs5/profile data
+query_acs_profile_2014 <- "DP03_0062E"
+acs_profile_2014 <- USCB_year_table("2014", "acs/acs5/profile",query_acs_profile_2014 )
+```
+
+We merge the three tables as one complete table on the fips id.
+
+```{r merge_api_data}
+df_2019 <- merge(acs_main_2019, acs_profile_2019, by = "fips", all = TRUE)
+df_full <- merge(df_2019,acs_profile_2014, by = 'fips', suffixes = c("_2019","_2014"))
+
+#write.csv(df_full, file = "./USCB_data.csv", row.names = FALSE)
+```
+
+## 3. Data Processing
+Based on a list of estimated values, we will first inspect column wise to see 
+if there is any variable that does not have a lot of observation.
+
+Then we will look row-wise to see if any census tracts does not have 
+sufficient data.
+
+For details of the estimate value encoding, see:
+https://www.census.gov/data/developers/data-sets/acs-1year/notes-on-acs-estimate-and-annotation-values.html
+
+
+```{r inspect_inv_value}
+# Inspect the distribution of estimated vals
+est_val <- as.numeric(c(-666666666,-999999999,-888888888,-222222222,-333333333,-555555555, NULL))
+# concert all column as numeric
+df_full <- df_full %>% mutate_at(2:22, as.numeric)
+# Column-wise count of values in the given vector
+column_count <- colSums(df_full == est_val)
+# Print the result
+print(column_count)
+```
+
+We observe that across the columns for employment details (B24031_002E, B24031_006E),
+a lot of the census tract has too little of a sample size for a good estimate (which are encoded as -666666666).
+Dropping these rows naively will significantly reduce the size of the dataset. 
+Hence, we will assume that there is no individual employed into the given sector 
+by replacing the value with 0.
+
+```{r filter_inv_value}
+# filter the data frame
+df_filter <- df_full %>%
+        mutate(across(all_of(c("B24031_002E", "B24031_006E","DP03_0033PE","DP03_0035PE")),
+                ~ ifelse(. == -666666666, 0, .)))  %>% 
+        filter_all(all_vars(!. %in% est_val))
+```
+
+In the cleaning process, `r dim(df_full)[1]- dim(df_filter)[1]` out of `r dim(df_full)[1]`
+data points are dropped from the dataframe. For more rigorous study, we should look at the 
+distribution of the census tract being dropped. However,
+this is beyond the scope of this study, hence we will naively dropped them.
+
+
+We will now compute additional variables, namely by taking percentages 
+rather than absolute values. For example, rather than the aboslute number, we want to get the 
+percentage of population over 25 year-old who have obtained a 
+Bachelor's Degree or Above computed as follow:
+$$B16010\_0041PE= \frac{B16010\_041E }{B16010\_001E} $$
+
+Note that we change the suffix of the indicator for convenience with "PE" 
+that is consistent with the US Census Bureau convention.
+
+In addition, we will also compute the percentage change in income (DP03_0062E_delta)
+and create a new categorical variable that classify census tracts 
+into groups where median income has increased and decreased (INC_DELTA_K).
+```{r data_process}
+# compute the percentages
+df_processed <- df_filter  %>%
+        mutate(B16010_041PE = B16010_041E / B16010_001E,
+                B19055_002PE = B19055_002E / B19055_001E,
+                B02001_002PE = B02001_002E / B02001_001E,
+                B23025_004PE = B23025_004E / B23025_002E,
+                C18121_002PE = C18121_002E / C18121_001E,
+                C18121_006PE = C18121_006E / C18121_001E,
+                DP03_0062E_delta = (DP03_0062E_2019 - DP03_0062E_2014)/ DP03_0062E_2014,
+                INC_DELTA_K = ifelse((DP03_0062E_2019 - DP03_0062E_2014)/ DP03_0062E_2014 >0, "up",'down'),
+                DP04_0046PE = DP04_0046PE/ 100, # standardized percentage as decimal
+                DP03_0066PE = DP03_0066PE/100,
+                DP03_0033PE = DP03_0033PE/100,
+                DP03_0035PE = DP03_0035PE/100,
+                fips = str_pad(fips, width = 11, side = "left", pad = "0"))
+# add a column for state_fips (useful if contain more than one state)
+df_processed <- df_processed  %>%
+        mutate(fips_state = substr(fips, 1,2))
+
+# inspect the result
+summary(df_processed)
+
+# Subset rows with either infinity or NaN values
+na_inf_df <- df_processed %>%
+  filter_all(any_vars(is.na(.) | is.infinite(.)))
+dim(na_inf_df)
+# fill the nan value as 0
+df_processed <- df_processed %>%
+        filter_all(all_vars(!. %in% est_val))
+
+#write.csv(df_processed, file = "./USCB_data_cleaned.csv", row.names = FALSE)
+```
+
+## 4. Data Exploration
+We check the correlation between the variables by plotting the following heatmap
+```{r}
+# plot correlation heatmap
+corr_df <- df_processed  %>%
+                subset(select = -c(fips,INC_DELTA_K,fips_state))
+corr_mat <- cor(corr_df)
+
+# take only the lower triangle of corr_matrix
+get_lower_tri<-function(cormat){
+cormat[lower.tri(cormat)] <- NA
+return(cormat)
+}
+# get the lower triangle
+corr_mat_l <- get_lower_tri((corr_mat))
+
+# draw heat map
+melted_cormat <- melt(corr_mat_l, na.rm = TRUE)
+
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+```
+
+## 5. Model Fitting
+We remove the columns that are redundant for the model fitting proceses.
+```{r load_data}
+df <- df_processed  %>% 
+        filter(fips_state == "36")  %>% # getting only the NY data
+        mutate(INC_DELTA_K = as.factor(INC_DELTA_K))  %>%
+        subset(select = -c(DP03_0062E_2019, DP03_0062E_2014,fips_state, fips))
+head(df)
+```
+
+We then apply train-test split to model fiting and evaluation.
+We also create a hold-out validation set that could be use after
+we have selected the bets approach and conduct a final evaluation.
+The three sets of data are stored in to a list object `res_df`.
+
+```{r train_test_split}
+# split between train, test and validation set into a list of result dfs
+set.seed(2023)
+spec <- c(train = .6, test = .2, validate = .2)
+g <- sample(cut(seq(nrow(df)),  nrow(df)*cumsum(c(0,spec)), labels = names(spec)
+        ))
+res_df <- split(df, g)
+```
+
+### 5.1 Regression Model
+We will run a linear regression model, including all the variables to see the
+interaction between the predictors and the response variable.
+```{r ols}
+time1 <- Sys.time()
+lmodel <- lm(DP03_0062E_delta ~ . - INC_DELTA_K, data = res_df$train)
+sm_lm <- summary(lmodel)
+sm_lm
+
+lpred <- predict(lmodel, newdata = res_df$test)
+time.linear <- (Sys.time()-time1)
+
+#Calculating Mean Squared Error (MSE) on testing data
+linearmse <- mean((res_df$test$DP03_0062E_delta - lpred)^2)
+linearmsesqt <- (linearmse)^(1/2)
+```
+Having naively fitted an MLR model, we observed that there exists some relationships
+between the change in medium income and the social-demographic data that we have used. 
+We will now determine which variables should be excluded
+by applying regularization with Lasso Regression and subsequently consider the best subset.
+
+#### 5.1.1 Regularization with Lasso Regression
+We will first use the training data to determine the best $\lambda$.
+```{r lasso}
+# define the model matrix
+x_train <- model.matrix(DP03_0062E_delta~.-1, data = res_df$train[1:26])
+y_train <- res_df$train$DP03_0062E_delta
+x_test <- model.matrix(DP03_0062E_delta~.-1, data = res_df$test[1:26])
+y_test <- res_df$test$DP03_0062E_delta
+
+# fit the model
+cv.lasso <- cv.glmnet(x_train, y_train, alpha=1)
+plot(cv.lasso)
+coef(cv.lasso)
+
+# plot the model metrics
+par(mfrow = c(1,2))
+plot(cv.lasso, xvar="lambda", label= TRUE)
+plot(cv.lasso, xvar="dev", label= TRUE)
+par(mfrow = c(1,1))
+
+# save the result of the best model
+coef <- coef(glmnet(x_train,y_train,alpha=1, lambda=cv.lasso$lambda.min))
+indices <- which(coef != 0 , arr.ind = TRUE)
+predictors <- dimnames(indices)[[1]][-1]
+```
+Using the lasso regression, we obtain a OLS model with `r length(predictors) -1 ` predictors, 
+including `r predictors`.
+
+
+```{r lasso_result}
+# define the final model using lasso
+lasso <- glmnet(x_train,y_train,lambda = cv.lasso$lambda.min)
+lasso_predict <- predict(lasso,x_test)
+# compute the test RMSE
+rmse_lasso <- sqrt(apply((y_test - lasso_predict)^2,2,mean))
+```
+With $\lambda = `r cv.lasso$lambda.min`$, we yield a model that has a $RMSE_{test} = `r rmse_lasso`$
+
+```{r Time taken for lasso}
+time1 <- Sys.time()
+cv.lasso <- cv.glmnet(x_train, y_train, alpha=1)
+lasso <- glmnet(x_train,y_train,lambda = cv.lasso$lambda.min)
+lasso_predict <- predict(lasso,x_test)
+time.lasso <- (Sys.time()-time1)
+```
+
+
+#### 5.1.2 Best Subset MLR
+```{r best_subset}
+# fit the model
+regfit_full <- regsubsets(DP03_0062E_delta ~.- INC_DELTA_K, 
+                data = res_df$train, nvmax = 25)
+reg_summary <- summary(regfit_full)
+
+# plot resquare
+par(mfrow=c(2,2))
+# plot RSS
+plot(reg_summary$rss, xlab="Number of Variables", ylab="RSS")
+# plot adjusted r squared
+plot(reg_summary$adjr2, xlab="Number of Variables", ylab="Adjusted RSq", type="l")
+best_model <- which.min(reg_summary$cp)
+points(best_model, reg_summary$adjr2[best_model], col="red", cex=2, pch=20)
+#  plot Cp 
+plot(reg_summary$cp, xlab="Number of Variables", ylab="Cp", type="l")
+best_model <- which.min(reg_summary$cp)
+points(best_model, reg_summary$cp[best_model], col="red", cex=2, pch=20)
+# plot BIC
+plot(reg_summary$bic, xlab="Number of Variables", ylab="BIC", type="l")
+best_model <- which.min(reg_summary$bic)
+points(best_model, reg_summary$bic[best_model], col="red", cex=2, pch=20)
+
+# parse the best subset result by r squared
+n_predictors <- which.max(reg_summary$adjr2)
+predictors <- names(reg_summary$which[n_predictors, reg_summary$which[n_predictors,]])[-1]
+
+```
+
+Under different information criterion, however, the optimal model identified is different.
+From this result, we observe that the best performing model 
+uses $`r n_predictors`$ predictors including `r predictors`.
+
+This model yields an adjusted $R^2$ of `r max(reg_summary$adjr2)` on the training data set.
+
+For the full result, this can be inspected using the plots below.
+
+```{r, fig.height = 10, fig.width = 10, fig.align = "center"}
+par(mfrow=c(2,2))
+plot(regfit_full, scale="r2")
+plot(regfit_full, scale="adjr2")
+plot(regfit_full, scale="Cp")
+plot(regfit_full, scale="bic")
+```
+
+With the model that we selected, we compute the $RMSE_{test}$ so we 
+can compare it with other models yielded from other methods later.
+
+```{r best_subset_result}
+# define function to get the prediction using the best model 
+predict_regsubsets <- function(object, newdata, id, ...) {
+  form = as.formula(object$call[[2]])
+  mat = model.matrix(form, newdata)
+  coef_i = coef(object, id = id)
+  mat[, names(coef_i)] %*% coef_i
+}
+# compute the RMSE
+pred <- predict_regsubsets(regfit_full,res_df$test, id = which.max(reg_summary$adjr2))
+rmse_bestsubset <- sqrt(mean((res_df$test$DP03_0062E_delta- pred)^2))
+```
+
+From this optimal model we selected, we yield a $RMSE_{test} = `r rmse_bestsubset`$
+
+```{r time_best_subset}
+time1 <- Sys.time()
+regfit_full <- regsubsets(DP03_0062E_delta ~.- INC_DELTA_K, 
+                data = res_df$train, nvmax = 25)
+pred <- predict_regsubsets(regfit_full,res_df$test, id = which.max(reg_summary$adjr2))
+time.bestsubset <- (Sys.time()- time1)
+```
+
+
+#### 5.1.3 Principal Component Regression
+```{r principal component regression}
+# fit the model
+time1 <- Sys.time()
+pcr_model <- pcr(DP03_0062E_delta~ ., data = res_df$train, 
+                validation = "CV", scale = T)
+sm_pcr <- summary(pcr_model)
+# "selectNcomp()" Choosing the best number of components in PCR.
+# "method = `onesigma`" implies the "1 stdandard error rule".
+selectNcomp(pcr_model, method = "onesigma", plot = TRUE)
+# Predicted values
+pcrpred <- predict(pcr_model, newdata = res_df$test)
+time.pcr <- (Sys.time()- time1)
+
+#Calculating Mean Squared Error (MSE)
+mse <- mean((res_df$test$DP03_0062E_delta - pcrpred)^2)
+rmse_pcr <- (mse)^(1/2)
+
+```
+From this model trained under the PCA algorithm, 
+it yields a $RMSE_{test} = `r rmse_pcr`$
+
+#### 5.1.5 Neural Network
+```{r nn_train}
+# construct the model matrix
+NNdata <- model.matrix(DP03_0062E_delta~. - INC_DELTA_K, data = df)
+NNdata <- subset(NNdata, select = -c(1)) # drop the intercept col
+
+# add back the response varaible
+NNdata <- cbind(NNdata,df$DP03_0062E_delta)
+colnames(NNdata)[dim(NNdata)[2]] <- 'DP03_0062E_delta'
+
+# scaling the data
+maxs <- apply(NNdata, 2, max)
+mins <- apply(NNdata, 2, min)
+scaled_NNdata <- as.data.frame(scale(NNdata, center = mins, scale = maxs - mins))
+
+# train the mode
+nn <- neuralnet(DP03_0062E_delta~., data= scaled_NNdata[rownames(res_df$train),],
+                hidden=c(5,3),linear.output=T)
+
+# inspect the training model result
+plot(nn)
+
+```
+
+We will now use the neural network result to predict on the testing data set.
+```{r nn_pred}
+# predict on the testing data set
+pred.nn <- compute(nn,scaled_NNdata[rownames(res_df$test),])
+
+# rescale the prediction
+pred.nn <- pred.nn$net.result * (max(df$DP03_0062E_delta) - min(df$DP03_0062E_delta)) + min(df$DP03_0062E_delta)
+mse_nn <- mean((res_df$test$DP03_0062E_delta - pred.nn)^2)
+rmse_nn <- sqrt(mse_nn)
+```
+From this neural network model, 
+it yields a $RMSE_{test} = `r rmse_nn`$
+```{r Time taken by neural netwok}
+time1<-Sys.time()
+nn <- neuralnet(DP03_0062E_delta~., data= scaled_NNdata[rownames(res_df$train),],
+                hidden=c(5,3),linear.output=T)
+# predict on the testing data set
+pred.nn <- compute(nn,scaled_NNdata[rownames(res_df$test),])
+
+# re-scale the prediction
+pred.nn <- pred.nn$net.result * (max(df$DP03_0062E_delta) - min(df$DP03_0062E_delta)) + min(df$DP03_0062E_delta)
+time.nn <- (Sys.time()-time1)
+
+```
+
+
+#### 5.1.4 Model Validation
+Finally, we will use the model with the smallest $RMSE_{test}$ to see how it 
+performs on the validation set.
+
+|Regression Methods               |Measure(Root MSE)    |Time Taken(in seconds)
+|---------------------            |-----------------    |----------            
+|Linear Regression                |`r linearmsesqt`     |`r time.linear`
+|Lasso                            |`r rmse_lasso`       |`r time.lasso`
+|Best Subset                      |`r rmse_bestsubset`  |`r time.bestsubset`      
+|Principal Component Regression   |`r rmse_pcr`         |`r time.pcr`  
+|Neural Network                   |`r rmse_nn`          |`r time.nn`
+
+Comparing the result from the above, lasso and best subset showed similar performance.
+We moved forward with LASSO Regression because the LASSO regression has a good functional form.
+While the best subset are more flexibile, providing better control 
+since we could choose between $AIC$, $C_p$, adjusted $R^2$ and $BIC$ to evaluate our model,
+we think that it will be harder to reproduce at scale when we want to apply the model again
+to another dataset, say for a neighbouring state.
+
+
+```{r regression_validation}
+x_val <- model.matrix(DP03_0062E_delta~.-1, data = res_df$validate[1:26])
+y_val <- res_df$validate$DP03_0062E_delta
+lasso_predict <- predict(lasso,x_val)
+#compute the test RMSE
+val_lasso <- sqrt(apply((y_val - lasso_predict)^2,2,mean))
+```
+
+We used the lasso regression to fit our model to the validation set and the MSE that we get is `r val_lasso`
+
+### 5.2 Classification Problem
+As observed from the section above, the machine learning models 
+employed perform rather poorly on the data set. 
+
+Namely the adjusted $R^2$ falls mostly around **$`r `$ need to replace**
+
+While this is not uncommon for economic study to have such a low
+$R^2$, we would like to see if simplifying the research question to one 
+of classification will yield better result.
+
+Nonetheless, due to the class imbalance, with only `r aggregate(df$INC_DELTA_K, by=list(df$INC_DELTA_K), FUN=length)[1,2]`
+of the observation recording a decrease in the median income over the study period
+
+```{r custom_define}
+classification_matrix <- function(confusion_matrix){
+        #' return the specificity, sensitivity, and accuracy given a confusion matrix 
+        #' here sensitive refers to sensitive to detecting decrease in income
+        sens <- confusion_matrix[1,1] / (confusion_matrix[1,1] + confusion_matrix[2,1])
+        spec <- confusion_matrix[2,2] / (confusion_matrix[2,2] + confusion_matrix[1,2])
+        accu <- (confusion_matrix[1,1] + confusion_matrix[2,2]) / sum(confusion_matrix)
+        return(list(spec = spec, sens = sens, accu = accu))
+}
+```
+
+#### 5.2.1 Logistic Regression
+```{r logit}
+# Specify type of training method used and the number of folds
+ctrlspecs <- trainControl(method="cv", 
+                          number=5, 
+                          savePredictions="all",
+                          classProbs=TRUE)
+logit <- train(INC_DELTA_K ~ . - DP03_0062E_delta, data=res_df$train, 
+                method="glm", 
+                family=binomial, 
+                trControl=ctrlspecs)
+print(logit)
+```
+
+We used the Cross-Validation Method to evaluate the best subset model. Althoug the `leaps::regsubsets()` can help
+us identify the best subset of variable used for the logistic regression,
+it does not provide an intuitive evaluation matrix that we could use to compare the results.
+Hence, we wrote a custom function which runs through $k$-fold iteration for comparing the model 
+by classification accuracy.
+
+
+```{r logit_cv}
+# create a function for variable selection using cross validation
+logistic_cv <- function(data_train, k = 5, nvmax = NULL) {
+        if (is.null(nvmax)){
+                nvmax <- dim(data_train)[2]-1
+        }
+        #` Conduct a best subset search for variable selection under logistic regression
+        p <- dim(data)[2] - 1 # exclude the response
+        cv.accu <- rep(NA, times = nvmax) # the train approach can only return accuracy
+
+        # return the best subset by number of variables
+        logit_subset <- regsubsets(INC_DELTA_K ~ ., data = cv_data, nvmax = nvmax)
+        logit_summary <- summary(logit_subset)
+
+        for (i in 1:nvmax){
+                #print(sprintf("looping through %d variable model", i))
+                variables_vect <- names(logit_summary$which[i,][which(logit_summary$which[i,])])[-1]
+                df <- data_train  %>%
+                        subset(select = c(variables_vect, "INC_DELTA_K"))
+                # apply the logistic regression
+                ctrlspecs <- trainControl(method="cv", 
+                          number=5, 
+                          savePredictions="all",
+                          classProbs=TRUE)
+                logit <- train(INC_DELTA_K ~ ., data= df, 
+                                method="glm", 
+                                family=binomial, 
+                                trControl=ctrlspecs)
+                # return the accuracy rate
+                cv.accu[i] <- logit$results$Accuracy
+
+        }
+        return(list(accuracy = cv.accu,logit_summary = logit_summary))
+}
+
+# cv
+cv_data <- res_df$train  %>% subset(select = c(-DP03_0062E_delta))
+logistic_cv_result <- logistic_cv(cv_data)
+
+# parse the result
+max_accu <- max(logistic_cv_result$accuracy)
+n_predictors <- which.max(logistic_cv_result$accuracy)
+best_subset_result <- logistic_cv_result$logit_summary
+vars <- names(best_subset_result$which[n_predictors,][which(best_subset_result$which[n_predictors,])])[-1]
+```
+Using the cross-validation approach, we determined that the model with `r n_predictors` has the highest
+prediction accuracy, namely it identifies `r vars`
+as the predictors for the logistic regression.
+
+```{r log_cv_test}
+# define the train and test data set for the best subset
+df_train <- res_df$train  %>% subset(select= c(vars, "INC_DELTA_K"))
+df_test <- res_df$test  %>% subset(select= c(vars, "INC_DELTA_K"))
+
+logit <- glm(INC_DELTA_K~.,data = df_train,family = binomial)
+summary(logit)
+
+# predict on the test set
+glm_probs <- predict(logit, df_test, type = "response")
+# codity the probabilty to binary variable
+direction_test <- rep("down", length(glm_probs))
+direction_test[glm_probs > .5] <- "up"
+
+# output the confusion matrix
+logit_conf_m <- table(direction_test, df_test$INC_DELTA_K)
+logit_error <- mean(direction_test != df_test$INC_DELTA_K)
+logit_metrics <- classification_matrix(logit_conf_m)
+```
+With this logistic regression model, we yield a misclassification error rate
+of `r logit_error`.
+
+```{r}
+#time taken by Logistics
+time1 <- Sys.time()
+logistic_cv <- function(data_train, k = 5, nvmax = NULL) {
+        if (is.null(nvmax)){
+                nvmax <- dim(data_train)[2]-1
+        }
+        #` Conduct a best subset search for variable selection under logistic regression
+        p <- dim(data)[2] - 1 # exclude the response
+        cv.accu <- rep(NA, times = nvmax) # the train approach can only return accuracy
+
+        # return the best subset by number of variables
+        logit_subset <- regsubsets(INC_DELTA_K ~ ., data = cv_data, nvmax = nvmax)
+        logit_summary <- summary(logit_subset)
+
+        for (i in 1:nvmax){
+                #print(sprintf("looping through %d variable model", i))
+                variables_vect <- names(logit_summary$which[i,][which(logit_summary$which[i,])])[-1]
+                df <- data_train  %>%
+                        subset(select = c(variables_vect, "INC_DELTA_K"))
+                # apply the logistic regression
+                ctrlspecs <- trainControl(method="cv", 
+                          number=5, 
+                          savePredictions="all",
+                          classProbs=TRUE)
+                logit <- train(INC_DELTA_K ~ ., data= df, 
+                                method="glm", 
+                                family=binomial, 
+                                trControl=ctrlspecs)
+                # return the accuracy rate
+                cv.accu[i] <- logit$results$Accuracy
+
+        }
+        return(list(accuracy = cv.accu,logit_summary = logit_summary))
+}
+
+# cv
+cv_data <- res_df$train  %>% subset(select = c(-DP03_0062E_delta))
+logistic_cv_result <- logistic_cv(cv_data)
+
+# parse the result
+max_accu <- max(logistic_cv_result$accuracy)
+n_predictors <- which.max(logistic_cv_result$accuracy)
+best_subset_result <- logistic_cv_result$logit_summary
+vars <- names(best_subset_result$which[n_predictors,][which(best_subset_result$which[n_predictors,])])[-1]
+logit <- glm(INC_DELTA_K~.,data = df_train,family = binomial)
+# predict on the test set
+glm_probs <- predict(logit, df_test, type = "response")
+# codity the probabilty to binary variable
+direction_test <- rep("down", length(glm_probs))
+direction_test[glm_probs > .5] <- "up"
+
+
+df_train <- res_df$train  %>% subset(select= c(vars, "INC_DELTA_K"))
+df_test <- res_df$test  %>% subset(select= c(vars, "INC_DELTA_K"))
+
+logit <- glm(INC_DELTA_K~.,data = df_train,family = binomial)
+summary(logit)
+
+# predict on the test set
+glm_probs <- predict(logit, df_test, type = "response")
+# codity the probabilty to binary variable
+direction_test <- rep("down", length(glm_probs))
+direction_test[glm_probs > .5] <- "up"
+
+time.logit <- (Sys.time()- time1)
+```
+
+
+#### 5.2.2 Linear Discriminant Analysis
+```{r lda}
+# fit the model
+time1 <- Sys.time()
+lda_fit <- lda(INC_DELTA_K~.- DP03_0062E_delta, data=res_df$train)
+lda_fit
+
+# get the prediction
+lda_pred <- predict(lda_fit, res_df$test)
+lda_pred$class
+
+time.lda <- (Sys.time()-time1)
+
+# compute the confusion matrix
+lda_conf_m <- table(lda_pred$class, res_df$test$INC_DELTA_K)
+lda_error <- mean(lda_pred$class != res_df$test$INC_DELTA_K)
+lda_metrics <- classification_matrix(lda_conf_m)
+```
+With the linear discrimant analysis, we yield an accuracy of `r 1 - lda_error`.
+
+#### 5.2.3 Quadratic Discriminant Analysis
+```{r qda}
+# fit the model
+time1 <- Sys.time()
+qda_fit <- qda(INC_DELTA_K ~ . - DP03_0062E_delta, 
+                data = res_df$train)
+qda_fit
+
+# get prediction on testing data
+qda_pred <- predict(qda_fit, res_df$test)
+
+time.qda <- (Sys.time()-time1)
+
+# confusion matrix and error rate
+qda_conf_m <- table(qda_pred$class, res_df$test$INC_DELTA_K)
+qda_error <- mean(qda_pred$class != res_df$test$INC_DELTA_K)
+qda_metrics <- classification_matrix(qda_conf_m)
+
+
+```
+While the overall accuracy (`r 1 - qda_error`)is lower than the LDA model, 
+we observe that the QDA is more sensitive 
+to tracts with decrease in economic performance.
+It correctly classify `r qda_metrics$sens` of the census
+tracts that recorded a decrease in median income compare to only
+`r lda_metrics$sens` using the LDA model.
+
+#### 5.2.4 K Nearest Neighbours
+```{r}
+time1 <- Sys.time()
+kvals<-data.frame(k = seq(1, 135, by = 1))
+train_x<-res_df$train[,-which(names(res_df$train)=="INC_DELTA_K")]
+test_x<-res_df$test[,-which(names(res_df$test)=="INC_DELTA_K")]
+train_y<-res_df$train$INC_DELTA_K
+test_y<-res_df$test$INC_DELTA_K
+
+ctrl<-trainControl(method = "cv", number = 5)
+
+knn_model<-train(x = train_x, y = train_y, method = "knn",
+                   trControl = ctrl, tuneGrid = kvals)
+
+bestk<-knn_model$bestTune$k
+
+# get prediction on the testing data set
+knn_pred<-knn(train_x, test_x, train_y, k = bestk, prob = F)
+
+# return the evaluation metrics
+time.knn <- (Sys.time()-time1)
+table<-table(knn_pred, test_y)
+knn_error<-mean(knn_pred!=test_y)
+knn_metrics <- classification_matrix(table)
+```
+
+We do observe here that knn classifies everything to "up" category. This is also influenced by the 
+bigger class imbalance here.
+
+#### 5.2.5 Classification Tree
+```{r class_tree}
+
+tree_inc <- tree(INC_DELTA_K ~ .- DP03_0062E_delta, 
+                data = res_df$train,
+                )
+tree_inc
+```
+
+```{r viz_tree}
+plot(tree_inc)
+text(tree_inc, pretty = 0, cex = 0.5)
+```
+
+From the tree diagram, we could see that the classification tree always assign an observation
+with an "up" label and fails to identify any census tracts that has a decrease in median income.
+Since the "full tree" trained by the algorithm is close to a stump and the 
+predicted outcome is always an *increase in in median income*, 
+we assumed that a simple tree is not suitable for this problem and did not 
+proceed to prune the tree further. Instead, we move on to use more complex 
+tree-based model to see if the performance would improve.
+
+
+#### 5.2.6 Random Forest
+
+```{r random_forest}
+time1 <- Sys.time()
+
+# model fitting
+rfor_inc <- randomForest(INC_DELTA_K ~ .- DP03_0062E_delta, 
+                data = res_df$train,
+                mtry = 13,
+                )
+
+# predict on the test data
+rfor_pred <- predict(rfor_inc, newdata = res_df$test)
+
+# return the metric
+rfor_conf_m <- table(rfor_pred ,res_df$test$INC_DELTA_K)
+rfor_metrics <- classification_matrix(rfor_conf_m)
+time.rf <- (Sys.time()-time1)
+```
+
+Using a Random Forest algorithm, we could see an improvement in the predicted values.
+Although a lot of the "down" observation is still misclassified as "up" with the
+training set (sensitivity of `r rfor_metrics$sens`).
+
+
+### 5.2.7 Model Evaluation
+
+|Classification Method                |Accuracy                     |Sensitivity                |Specificity               |Time Taken(in seconds)  
+|------------------------             |----------                   |------------               |------------              |---------------------
+|Logistics Regression                 |`r 1- logit_error`           |`r logit_metrics$sens`     |`r logit_metrics$spec`    |`r time.logit`
+|Linear Discriminant Analysis         |`r 1-lda_error`              |`r lda_metrics$sens`       |`r lda_metrics$spec`      |`r time.lda`
+|Quadratic Discriminant Analysis      |`r 1- qda_error`             |`r qda_metrics$sens`       |`r qda_metrics$spec`      |`r time.qda`
+|K Nearest Neighbour                  |`r 1- knn_error`             |`r knn_metrics$sens`       |`r knn_metrics$spec`      |`r time.knn`
+|Random Forest                        |`r rfor_metrics$accu`        |`r rfor_metrics$sens`      |`r rfor_metrics$spec`     |`r time.rf`
+
+We will now use what we identified as the best model to see how it perform on unseen
+validation dataset.
+
+While the accuracy in simpler models, namely for logstic regression and lda, are higher, we believed that this is
+achieved by greedy allocation of observation as "up". As such, they perform poorly when 
+compared using the sensitivity. 
+While the random forest does perform better than the QDA in terms of accuracy and demonstrated
+similar snesiticity-specificity trade-off, it requires a higher computational processing.
+Hence, we will move forward with the QDA for the final classification model.
+
+```{r class_validation}
+# apply the model on res_df$validate
+qda_pred_valid <- predict(qda_fit, res_df$validate)
+
+# return confusion matrix
+qda_valid_conf_m <- table(qda_pred_valid$class, res_df$validate$INC_DELTA_K)
+qda_erroir <- mean(qda_pred_valid$class != res_df$validate$INC_DELTA_K)
+qda_metric_valid <- classification_matrix(qda_valid_conf_m)
+```
+
+With this final classification model, we determined that the accuracy, sensistivity,
+and specificity on the validation dataset as follow:
+
+|Accuracy |Sensitivity| Specificity|
+|----------- | -------- | --------- |
+|`r qda_metric_valid$accu` | `r qda_metric_valid$sens` | `r qda_metric_valid$spec`
